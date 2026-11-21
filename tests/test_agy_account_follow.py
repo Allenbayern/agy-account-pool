@@ -2,7 +2,7 @@
 """Sanitized unit tests for agy-account-pool (agy-account-follow)."""
 
 import base64
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 import datetime as _dt
 import fcntl
 import io
@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 if _ROOT not in sys.path:
@@ -327,6 +328,171 @@ class TestAgyAccountPool(unittest.TestCase):
         self.assertLess(os.path.getsize(self.log_path), 200)
         with open(self.log_path, encoding="utf-8") as fh:
             self.assertIn("ROTATION_CHECK line=4", fh.read())
+
+    def test_10_cli_only_primary_anchor_without_accounts_json(self):
+        accts = self._seed_pool(desktop_id="id-1", cli_acct=_acct_payload("id-2", "acct2@example.com"))
+        os.remove(os.path.join(self.tools, "accounts.json"))
+
+        st = engine.evaluate_pool_once(
+            self._args(cli_only=True, no_notify=True),
+            {},
+            now=time.time(),
+            dry_run=False,
+        )
+        self.assertTrue(st["cli_only"])
+        self.assertEqual(st["decision"], "pool_keep")
+        self.assertEqual(st["cli_account"], "acct2@example.com")
+        self.assertEqual(st["active_account"], "acct2@example.com")
+        self.assertEqual(st["target_account"], "acct2@example.com")
+        self.assertTrue(st["in_sync"])
+        self.assertNotIn("warning", st)
+        self.assertFalse(os.path.exists(self.at_calls))
+        self.assertEqual(switcher.cli_identity()[0], accts["acct2@example.com"]["email"])
+
+    def test_11_cli_only_quota_threshold_switch_bypasses_desktop(self):
+        now = time.time()
+        os.makedirs(os.path.join(self.gemini, "antigravity"), exist_ok=True)
+        low = _acct_payload("id-low", "low@example.com", w5h=0.12, gem_pct=12, now=int(now))
+        accts = self._seed_pool(desktop_id="id-1", cli_acct=low, extra_accts=[low])
+        os.remove(os.path.join(self.tools, "accounts.json"))
+
+        ts_str = _dt.datetime.fromtimestamp(now).strftime("%m%d %H:%M:%S")
+        with open(self.desktop_log, "w", encoding="utf-8") as fh:
+            fh.write("I%s 1 http_helpers.go:709] streamGenerateContent?alt=sse\n" % ts_str)
+        os.utime(self.desktop_log, (now, now))
+
+        state = {}
+        st1 = engine.evaluate_pool_once(
+            self._args(cli_only=True, no_notify=True),
+            state,
+            now=now,
+            dry_run=False,
+        )
+        self.assertEqual(st1["decision"], "threshold_cli")
+        self.assertEqual(st1["target_account"], "acct1@example.com")
+        self.assertEqual(switcher.cli_identity()[0], "acct1@example.com")
+        self.assertGreater(quota.quarantine_left(state, "low@example.com", now=now), 0)
+        self.assertFalse(os.path.exists(self.at_calls))
+
+        switcher.sync_cli_only(accts["acct4@example.com"], no_reload=True, sync_cursor_flag=False, force=True)
+        state2 = {}
+        st2 = engine.evaluate_pool_once(
+            self._args(cli_only=True, no_notify=True),
+            state2,
+            now=now + 200,
+            dry_run=False,
+        )
+        self.assertEqual(st2["decision"], "threshold_urgent")
+        self.assertEqual(st2["target_account"], "acct1@example.com")
+        self.assertEqual(switcher.cli_identity()[0], "acct1@example.com")
+        self.assertFalse(os.path.exists(self.at_calls))
+        for p_key in ("OAUTH_CREDS", "GOOGLE_ACCOUNTS", "CLI_TOKEN", "ANTIGRAVITY_TOKEN", "JETSKI_TOKEN"):
+            self.assertTrue(os.path.exists(config.get_paths()[p_key]), p_key)
+
+    def test_12_cli_only_extra_log_429_dsh_and_gemini_cli(self):
+        now = int(time.time())
+        accts = self._seed_pool(desktop_id="id-1", cli_acct=_acct_payload("id-1", "acct1@example.com", now=now))
+        os.remove(os.path.join(self.tools, "accounts.json"))
+        switcher.sync_cli_only(accts["acct1@example.com"], no_reload=True, sync_cursor_flag=False, force=True)
+
+        dsh_log = os.path.join(self.root, "dsh.log")
+        gem_dir = os.path.join(self.root, "gemini_logs")
+        os.makedirs(gem_dir, exist_ok=True)
+        gem_log = os.path.join(gem_dir, "run1.log")
+        glob_pat = os.path.join(gem_dir, "*.log")
+        with open(dsh_log, "w", encoding="utf-8") as fh:
+            fh.write("dsh started\n")
+        with open(gem_log, "w", encoding="utf-8") as fh:
+            fh.write("gemini cli started\n")
+
+        state = {}
+        self.assertEqual(
+            monitor.scan_logs_for_quota_errors(state, now=now, init_to_eof=True, cli_only=True, extra_logs=[dsh_log, glob_pat]),
+            [],
+        )
+
+        with open(dsh_log, "a", encoding="utf-8") as fh:
+            fh.write("UNAVAILABLE (code 503): No capacity available\n")
+            fh.write("dial tcp: lookup oauth2.googleapis.com: no such host\n")
+        self.assertEqual(
+            monitor.scan_logs_for_quota_errors(state, now=now + 1, init_to_eof=True, cli_only=True, extra_logs=[dsh_log, glob_pat]),
+            [],
+        )
+
+        with open(dsh_log, "a", encoding="utf-8") as fh:
+            fh.write("GaxiosError: 429 RESOURCE_EXHAUSTED on daily-cloudcode-pa\n")
+        with open(gem_log, "a", encoding="utf-8") as fh:
+            fh.write("You have exhausted your capacity on this model. Your quota will reset after 1h 30m.\n")
+
+        hits = monitor.scan_logs_for_quota_errors(state, now=now + 2, init_to_eof=True, cli_only=True, extra_logs=[dsh_log, glob_pat])
+        self.assertEqual(len(hits), 2)
+        self.assertTrue(all(h["source"] == "extra" for h in hits))
+        self.assertEqual(hits[-1]["reset_secs"], 5400)
+
+        st = engine.evaluate_pool_once(
+            self._args(cli_only=True, no_notify=True, extra_log=[dsh_log, glob_pat]),
+            state,
+            now=now + 2,
+            dry_run=False,
+            pre_hits=hits,
+        )
+        self.assertEqual(st["decision"], "quota_error_429_switch")
+        self.assertEqual(st["target_account"], "acct3@example.com")
+        self.assertEqual(switcher.cli_identity()[0], "acct3@example.com")
+        self.assertEqual(quota.quarantine_left(state, "acct1@example.com", now=now + 2), 5400)
+        self.assertFalse(os.path.exists(self.at_calls))
+
+    def test_13_cli_only_disallowed_account_jit_and_switch_to(self):
+        personal = _acct_payload("id-p", "personal@example.com", w5h=1.0, gem_pct=100)
+        self._seed_pool(desktop_id="id-2", cli_acct=personal, extra_accts=[personal])
+        config.atomic_write_json(self.cfg_path, {"allowed_accounts": [], "excluded_accounts": ["personal@example.com"]})
+
+        st = engine.evaluate_pool_once(
+            self._args(cli_only=True, no_notify=True),
+            {},
+            now=time.time(),
+            dry_run=False,
+        )
+        self.assertEqual(st["target_account"], "acct1@example.com")
+        self.assertEqual(switcher.cli_identity()[0], "acct1@example.com")
+        self.assertFalse(os.path.exists(self.at_calls))
+
+        os.remove(self.cfg_path)
+        switcher.sync_cli_only(personal, no_reload=True, sync_cursor_flag=False, force=True)
+        config.atomic_write_json(self.cfg_path, {"allowed_accounts": [], "excluded_accounts": ["personal@example.com"]})
+
+        rc = engine.main(["--apply", "--mode", "pool", "--cli-only", "--jit", "--no-notify"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(switcher.cli_identity()[0], "acct1@example.com")
+        self.assertFalse(os.path.exists(self.at_calls))
+
+        out_buf = io.StringIO()
+        with redirect_stdout(out_buf):
+            rc2 = engine.main(["--switch-to", "acct2@example.com", "--cli-only", "--no-notify", "--json"])
+        self.assertEqual(rc2, 0)
+        self.assertEqual(switcher.cli_identity()[0], "acct2@example.com")
+        last_sw = config.load_state().get("last_switch") or {}
+        self.assertEqual(last_sw.get("from"), "acct1@example.com")
+        self.assertEqual(last_sw.get("to"), "acct2@example.com")
+        self.assertTrue(last_sw.get("cli_only"))
+        self.assertFalse(os.path.exists(self.at_calls))
+
+    def test_14_linux_default_paths_and_no_notify(self):
+        for k in ("AGY_DESKTOP_LS_LOG", "DESKTOP_LS_LOG", "AGY_FOLLOW_LOG_PATH", "LOG_PATH", "AGY_NO_NOTIFY"):
+            os.environ.pop(k, None)
+        xdg_state = os.path.join(self.root, "xdg_state")
+        os.environ["XDG_STATE_HOME"] = xdg_state
+
+        with patch.object(config.sys, "platform", "linux"), patch.object(switcher.sys, "platform", "linux"):
+            paths = config.get_paths()
+            self.assertEqual(paths["DESKTOP_LS_LOG"], "")
+            self.assertEqual(
+                paths["LOG_PATH"],
+                os.path.join(xdg_state, "agy-account-follow", "agy-account-follow.log"),
+            )
+            with patch.object(switcher.subprocess, "run") as mock_run:
+                switcher.notify_macos("title", "message")
+                mock_run.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -43,9 +43,9 @@
 
 ## 运行前提
 
-- **macOS**（依赖 `launchd`、`osascript` 通知及 `antigravity-tools` Keychain 切换）
-- **Python 3.9+**（系统 `/usr/bin/python3` 即可）
-- **Antigravity.app** 与 **[Antigravity Tools](https://github.com/lbjlaq/Antigravity-Manager)**（确保 `antigravity-tools` 在 `PATH`、`~/.local/bin/` 或 `/Applications/Antigravity Tools.app/Contents/MacOS/antigravity-tools`）
+- **macOS**：依赖 `launchd`、`osascript` 通知、**Antigravity.app** 及 **[Antigravity Tools](https://github.com/lbjlaq/Antigravity-Manager)**（确保 `antigravity-tools` 在 `PATH`、`~/.local/bin/` 或 `/Applications/Antigravity Tools.app/Contents/MacOS/antigravity-tools`）。
+- **Linux（纯 CLI `--cli-only` 模式）**：依赖 `systemd --user`（无需桌面端与 `antigravity-tools`）。将允许使用的账号 JSON 同步至 `~/.antigravity_tools/accounts/` 后执行 `./install.sh --cli-only --no-notify`，并可通过 `--extra-log <路径或通配符>`（或 `AGY_EXTRA_LOGS` / `config.json` 中 `extra_logs`）额外监听 `dsh` / `gemini` CLI 的 429 日志。
+- **Python 3.9+**（零第三方依赖，系统 `/usr/bin/python3` 即可）
 
 ## 快速安装
 
@@ -53,9 +53,12 @@
 git clone https://github.com/Allenbayern/agy-account-pool.git
 cd agy-account-pool
 ./install.sh
+
+# Linux 纯 CLI 模式（自动注册并启动 systemd --user 服务，可选附加 429 日志监听）：
+./install.sh --cli-only --no-notify --extra-log "$HOME/.dsh/logs/*.log"
 ```
 
-安装完成后，建议在 **Antigravity Tools 设置** 中确认以下 3 项（避免两套切换器冲突）：
+macOS 安装完成后，建议在 **Antigravity Tools 设置** 中确认以下 3 项（避免两套切换器冲突）：
 
 1. **关闭** 自带 **Classic 自动热切换**（`classic_auto_switch.enabled = false`）
 2. **开启后台自动刷新**，并将 **刷新间隔** 设为 **5 分钟**
@@ -80,7 +83,10 @@ cd agy-account-pool
 # 查看当前桌面端 / CLI 账号与全池健康度排行
 agy-account-follow --check --mode pool --threshold 0.15
 
-# 手动双端切换到指定账号（请在独立终端执行，避免打断客户端内嵌对话）
+# Linux 纯 CLI 模式查看状态
+agy-account-follow --check --mode pool --cli-only --threshold 0.15
+
+# 手动双端切换到指定账号（Linux 附带 --cli-only）
 agy-account-follow --switch-to acct2@example.com
 
 # 清空所有单账号隔离冷却计时
@@ -90,13 +96,14 @@ agy-account-follow --clear-cooldowns
 agy-follow-wrapper-hook --status
 agy-follow-wrapper-hook --install
 
-# 实时查看切换日志
+# 实时查看切换日志（macOS / Linux）
 tail -f ~/Library/Logs/agy-account-follow.log
+tail -f ~/.local/state/agy-account-follow/agy-account-follow.log
 
 # 运行单元测试
 python3 -m unittest discover -s tests -v
 
-# 卸载 LaunchAgent、钩子与软链（不会删除你的账号凭据）
+# 卸载 LaunchAgent / systemd --user 服务、钩子与软链（不会删除你的账号凭据）
 ./uninstall.sh
 ```
 

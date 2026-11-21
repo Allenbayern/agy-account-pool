@@ -43,9 +43,9 @@ Unified macOS auto-switcher that keeps **Antigravity Desktop (Classic)** and **`
 
 ## Prerequisites
 
-- **macOS** (uses `launchd`, `osascript` notifications, and `antigravity-tools` Keychain integration)
-- **Python 3.9+** (`/usr/bin/python3` works out of the box)
-- **Antigravity.app** and **[Antigravity Tools](https://github.com/lbjlaq/Antigravity-Manager)** (`antigravity-tools` CLI available in `PATH`, `~/.local/bin/`, or `/Applications/Antigravity Tools.app/Contents/MacOS/antigravity-tools`)
+- **macOS**: uses `launchd`, `osascript` notifications, **Antigravity.app**, and **[Antigravity Tools](https://github.com/lbjlaq/Antigravity-Manager)** (`antigravity-tools` CLI available in `PATH`, `~/.local/bin/`, or `/Applications/Antigravity Tools.app/Contents/MacOS/antigravity-tools`).
+- **Linux (Pure CLI `--cli-only`)**: uses `systemd --user` (no Antigravity Desktop or `antigravity-tools` binary required). Sync allowed account JSONs into `~/.antigravity_tools/accounts/`, run `./install.sh --cli-only --no-notify`, and optionally pass `--extra-log <path_or_glob>` (or `AGY_EXTRA_LOGS` / `extra_logs` in `config.json`) to monitor `dsh` / `gemini` CLI 429 logs.
+- **Python 3.9+** (standard library only; `/usr/bin/python3` works out of the box)
 
 ## Quick Start
 
@@ -53,9 +53,12 @@ Unified macOS auto-switcher that keeps **Antigravity Desktop (Classic)** and **`
 git clone https://github.com/Allenbayern/agy-account-pool.git
 cd agy-account-pool
 ./install.sh
+
+# On Linux (Pure CLI mode with systemd --user + optional extra 429 log watcher):
+./install.sh --cli-only --no-notify --extra-log "$HOME/.dsh/logs/*.log"
 ```
 
-Recommended **Antigravity Tools** settings (prevents two switchers from fighting):
+Recommended **Antigravity Tools** settings on macOS (prevents two switchers from fighting):
 
 1. **Disable** built-in **Classic Auto-Switch** (`classic_auto_switch.enabled = false`)
 2. **Keep Auto-Refresh enabled** and set **Refresh Interval** to **5 minutes**
@@ -80,7 +83,10 @@ Environment overrides `AGY_EXCLUDED_ACCOUNTS` and `AGY_ALLOWED_ACCOUNTS` (comma-
 # Inspect Desktop vs. CLI status and pool quota table
 agy-account-follow --check --mode pool --threshold 0.15
 
-# Manually switch both Desktop and CLI (run from an external terminal)
+# Inspect Linux pure-CLI status
+agy-account-follow --check --mode pool --cli-only --threshold 0.15
+
+# Manually switch both Desktop and CLI (or --cli-only on Linux)
 agy-account-follow --switch-to acct2@example.com
 
 # Clear per-account 429/threshold quarantine timers
@@ -90,13 +96,14 @@ agy-account-follow --clear-cooldowns
 agy-follow-wrapper-hook --status
 agy-follow-wrapper-hook --install
 
-# Follow live daemon logs
+# Follow live daemon logs (macOS / Linux)
 tail -f ~/Library/Logs/agy-account-follow.log
+tail -f ~/.local/state/agy-account-follow/agy-account-follow.log
 
 # Run unit tests
 python3 -m unittest discover -s tests -v
 
-# Uninstall LaunchAgent, wrapper hook, and symlinks
+# Uninstall LaunchAgent / systemd --user unit, wrapper hook, and symlinks
 ./uninstall.sh
 ```
 

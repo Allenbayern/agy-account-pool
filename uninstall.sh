@@ -19,6 +19,18 @@ if [[ -f "$PLIST_DST" ]]; then
   echo "Unloaded and removed $PLIST_DST"
 fi
 
+UNIT_DST="$HOME/.config/systemd/user/agy-account-follow.service"
+if [[ -f "$UNIT_DST" ]]; then
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user disable --now agy-account-follow.service 2>/dev/null || true
+    rm -f "$UNIT_DST"
+    systemctl --user daemon-reload 2>/dev/null || true
+  else
+    rm -f "$UNIT_DST"
+  fi
+  echo "Disabled and removed $UNIT_DST"
+fi
+
 if [[ -f "$HOME/.gemini/bin/agy" && -x "$BIN_DIR/agy-follow-wrapper-hook" ]]; then
   python3 "$BIN_DIR/agy-follow-wrapper-hook" --revert || true
 fi

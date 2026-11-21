@@ -44,7 +44,22 @@ from .switcher import (
     reap_orphan_sidecars,
     switch_desktop_and_cli,
     sync_cli_only,
+    sync_cursor,
 )
+
+
+def _empty_score():
+    return {
+        "known": False,
+        "min_frac": None,
+        "weekly_5h": None,
+        "models_min_frac": None,
+        "effective_frac": None,
+        "zero_models": [],
+        "reset_ts": None,
+        "stale": True,
+        "group_name": None,
+    }
 
 
 def _quarantine_secs_from_score(score, now):
@@ -58,10 +73,46 @@ def run_jit(args):
     with acquire_lock(nonblocking=True) as acquired:
         if not acquired:
             return 0
+        cli_only = bool(getattr(args, "cli_only", False))
+        cli_email, _ = cli_identity()
+        if cli_only:
+            now = time.time()
+            state = load_state()
+            cds = prune_cooldowns(state, now=now)
+            by_email = {(a.get("email") or "").lower(): a for a in list_accounts()}
+            cur_acct = by_email.get((cli_email or "").lower())
+            healthy = bool(
+                cli_email
+                and is_account_allowed(cli_email)
+                and cur_acct is not None
+                and usable(cur_acct)
+                and quarantine_left(cds, cli_email, now) <= 0
+            )
+            if not healthy:
+                picked, _, _ = pick_healthy(
+                    args.threshold,
+                    exclude_email=cli_email,
+                    now=now,
+                    group=args.group,
+                    cooldowns=cds,
+                    allow_fallback=True,
+                )
+                if picked is not None:
+                    res = sync_cli_only(
+                        picked,
+                        no_reload=args.no_reload,
+                        sync_cursor_flag=True,
+                        force=False,
+                    )
+                    log(
+                        "JIT_CLI_SYNC %s -> %s (hub_reload=%s)"
+                        % (cli_email, picked.get("email"), "yes" if res.get("hub_reload") else "no")
+                    )
+            return 0
+
         desktop_acct, _, _ = tools_active_account("classic")
         if desktop_acct is None:
             return 0
-        cli_email, _ = cli_identity()
         want_email = desktop_acct.get("email") or ""
         if (cli_email or "").strip().lower() != want_email.strip().lower():
             res = sync_cli_only(
@@ -79,34 +130,65 @@ def run_jit(args):
 
 def evaluate_pool_once(args, state, now=None, dry_run=False, init_log_eof=True, pre_hits=None):
     now = now if now is not None else time.time()
-    source = args.source or "classic"
-    desktop_acct, desktop_reason, desktop_meta = tools_active_account(source)
-    desktop_email = desktop_acct.get("email") if desktop_acct else desktop_meta.get("raw_email")
+    cli_only = bool(getattr(args, "cli_only", False))
+    extra_logs = getattr(args, "extra_log", None) or []
     cli_email, cli_src = cli_identity()
     cds = prune_cooldowns(state, now=now)
     pool = list_accounts()
     by_email = {(a.get("email") or "").lower(): a for a in pool}
-    schema_drift = (desktop_meta.get("reason_code") == "missing_field") and bool(pool)
+
+    if cli_only:
+        desktop_acct, desktop_reason, desktop_meta = None, "", {"reason_code": "cli_only"}
+        desktop_email = None
+        schema_drift = False
+        raw_acct = by_email.get((cli_email or "").lower())
+        if cli_email and not is_account_allowed(cli_email):
+            active_acct = None
+            active_reason = "Account %s is excluded or not allowed by policy" % cli_email
+            active_reason_code = "whitelist_blocked"
+        elif raw_acct is None:
+            active_acct = None
+            active_reason = (
+                ("CLI 当前账号 %s 不在账号池中" % cli_email)
+                if cli_email
+                else "未检测到当前 CLI 账号"
+            )
+            active_reason_code = "cli_not_in_pool"
+        elif not usable(raw_acct):
+            active_acct = None
+            active_reason = "当前 CLI 账号 %s 不可用" % cli_email
+            active_reason_code = "account_disabled"
+        else:
+            active_acct = raw_acct
+            active_reason = ""
+            active_reason_code = "ok"
+        active_email = cli_email
+        score_acct = raw_acct
+    else:
+        source = args.source or "classic"
+        desktop_acct, desktop_reason, desktop_meta = tools_active_account(source)
+        desktop_email = desktop_acct.get("email") if desktop_acct else desktop_meta.get("raw_email")
+        schema_drift = (desktop_meta.get("reason_code") == "missing_field") and bool(pool)
+        active_acct = desktop_acct
+        active_email = desktop_email
+        active_reason = desktop_reason
+        active_reason_code = desktop_meta.get("reason_code")
+        score_acct = desktop_acct or by_email.get((desktop_email or "").lower())
 
     scan_state = copy.deepcopy(state) if dry_run else state
     error_hits = (
         pre_hits
         if pre_hits is not None
-        else scan_logs_for_quota_errors(scan_state, now=now, init_to_eof=init_log_eof)
+        else scan_logs_for_quota_errors(
+            scan_state,
+            now=now,
+            init_to_eof=init_log_eof,
+            cli_only=cli_only,
+            extra_logs=extra_logs,
+        )
     )
 
-    d_acct_for_score = desktop_acct or by_email.get((desktop_email or "").lower())
-    d_score = quota_score(d_acct_for_score, now=now, group=args.group) if d_acct_for_score else {
-        "known": False,
-        "min_frac": None,
-        "weekly_5h": None,
-        "models_min_frac": None,
-        "effective_frac": None,
-        "zero_models": [],
-        "reset_ts": None,
-        "stale": True,
-        "group_name": None,
-    }
+    active_score = quota_score(score_acct, now=now, group=args.group) if score_acct else _empty_score()
     _p, _ps, full_table = pick_healthy(
         args.threshold,
         exclude_email=None,
@@ -116,7 +198,7 @@ def evaluate_pool_once(args, state, now=None, dry_run=False, init_log_eof=True, 
     )
 
     decision = "pool_keep"
-    target_acct = desktop_acct
+    target_acct = active_acct
     note = ""
     action = "none"
     sync_cursor_flag = bool(args.sync_cursor or args.mode == "pool")
@@ -125,9 +207,13 @@ def evaluate_pool_once(args, state, now=None, dry_run=False, init_log_eof=True, 
     last_sw = state.get("last_switch") or {}
 
     if error_hits:
-        desktop_hits = [h for h in error_hits if h.get("source") == "desktop"]
-        hit = desktop_hits[-1] if desktop_hits else error_hits[-1]
-        affected = desktop_email if hit.get("source") == "desktop" else (cli_email or desktop_email)
+        if cli_only:
+            hit = error_hits[-1]
+            affected = cli_email
+        else:
+            desktop_hits = [h for h in error_hits if h.get("source") == "desktop"]
+            hit = desktop_hits[-1] if desktop_hits else error_hits[-1]
+            affected = desktop_email if hit.get("source") == "desktop" else (cli_email or desktop_email)
         q_secs = hit.get("reset_secs") or DEFAULT_QUARANTINE_SECONDS
         q_secs = max(MIN_QUARANTINE_SECONDS, min(MAX_QUARANTINE_SECONDS, int(q_secs)))
         if not dry_run and affected:
@@ -159,13 +245,14 @@ def evaluate_pool_once(args, state, now=None, dry_run=False, init_log_eof=True, 
                         picked,
                         state,
                         "quota_error_429",
-                        desktop_email,
+                        active_email,
                         now=now,
-                        cli_only=args.cli_only,
+                        cli_only=cli_only,
                         no_reload=args.no_reload,
                         sync_cursor_flag=sync_cursor_flag,
                         notify=not args.no_notify,
                         force=args.force,
+                        extra_logs=extra_logs,
                     )
                     action = "switched" if ok else "error"
                     if not ok:
@@ -180,27 +267,27 @@ def evaluate_pool_once(args, state, now=None, dry_run=False, init_log_eof=True, 
         decision = "schema_drift_hold"
         note = desktop_reason or "accounts.json 结构异常，暂不切换"
     else:
-        d_quarantined = quarantine_left(cds, desktop_email, now) > 0
-        d_unusable = (desktop_acct is None) or (not usable(desktop_acct))
-        d_eff = d_score.get("effective_frac")
-        d_models_min = d_score.get("models_min_frac")
-        d_below = bool(d_score["known"] and d_eff is not None and d_eff <= args.threshold)
+        a_quarantined = quarantine_left(cds, active_email, now) > 0
+        a_unusable = (active_acct is None) or (not usable(active_acct))
+        a_eff = active_score.get("effective_frac")
+        a_models_min = active_score.get("models_min_frac")
+        a_below = bool(active_score["known"] and a_eff is not None and a_eff <= args.threshold)
 
-        if d_unusable or d_quarantined or d_below:
+        if a_unusable or a_quarantined or a_below:
             urgent = (
-                d_unusable
-                or d_quarantined
+                a_unusable
+                or a_quarantined
                 or bool(
-                    d_score["known"]
+                    active_score["known"]
                     and (
-                        (d_eff is not None and d_eff <= args.urgent_threshold)
-                        or (d_models_min is not None and d_models_min <= 0.0)
+                        (a_eff is not None and a_eff <= args.urgent_threshold)
+                        or (a_models_min is not None and a_models_min <= 0.0)
                     )
                 )
             )
             picked, picked_score, _ = pick_healthy(
                 args.threshold,
-                exclude_email=desktop_email,
+                exclude_email=active_email,
                 now=now,
                 group=args.group,
                 cooldowns=cds,
@@ -208,30 +295,30 @@ def evaluate_pool_once(args, state, now=None, dry_run=False, init_log_eof=True, 
             )
             if (
                 picked is not None
-                and (not d_unusable)
-                and (not d_quarantined)
+                and (not a_unusable)
+                and (not a_quarantined)
                 and picked_score["known"]
-                and d_score["known"]
-                and (picked_score.get("effective_frac") or 0.0) <= (d_eff or 0.0)
+                and active_score["known"]
+                and (picked_score.get("effective_frac") or 0.0) <= (a_eff or 0.0)
                 and (picked_score.get("effective_frac") or 0.0) <= args.threshold
             ):
                 picked = None
 
             if picked is None:
                 decision = "pool_exhausted"
-                note = desktop_reason or "当前账号额度低于阈值，但池中无更健康账号"
+                note = active_reason or "当前账号额度低于阈值，但池中无更健康账号"
                 if not dry_run:
                     state.pop("pending_switch", None)
                     save_state(state)
-            elif (not d_unusable) and (now - last_ts) < MIN_SWITCH_INTERVAL_THRESHOLD:
+            elif (not a_unusable) and (now - last_ts) < MIN_SWITCH_INTERVAL_THRESHOLD:
                 decision = "threshold_cooldown"
                 note = "触发阈值但处于 %ds 防抖冷却期" % MIN_SWITCH_INTERVAL_THRESHOLD
                 if not dry_run:
                     save_state(state)
             else:
                 deferred = False
-                trigger = "threshold_urgent" if urgent else "threshold_idle"
-                if (not urgent) and (not args.cli_only):
+                trigger = "threshold_urgent" if urgent else ("threshold_cli" if cli_only else "threshold_idle")
+                if (not urgent) and (not cli_only):
                     busy, busy_reason = is_desktop_busy(idle_seconds=args.idle_seconds, now=now)
                     if busy:
                         pend = state.get("pending_switch") or {}
@@ -258,20 +345,21 @@ def evaluate_pool_once(args, state, now=None, dry_run=False, init_log_eof=True, 
                     target_acct = picked
                     decision = trigger
                     if not dry_run:
-                        if desktop_email:
-                            q_s = _quarantine_secs_from_score(d_score, now)
-                            set_account_cooldown(state, desktop_email, now + q_s, trigger, now=now)
+                        if active_email:
+                            q_s = _quarantine_secs_from_score(active_score, now)
+                            set_account_cooldown(state, active_email, now + q_s, trigger, now=now)
                         ok, _res = switch_desktop_and_cli(
                             picked,
                             state,
                             trigger,
-                            desktop_email,
+                            active_email,
                             now=now,
-                            cli_only=args.cli_only,
+                            cli_only=cli_only,
                             no_reload=args.no_reload,
                             sync_cursor_flag=sync_cursor_flag,
                             notify=not args.no_notify,
                             force=args.force,
+                            extra_logs=extra_logs,
                         )
                         action = "switched" if ok else "error"
                         if not ok:
@@ -282,7 +370,7 @@ def evaluate_pool_once(args, state, now=None, dry_run=False, init_log_eof=True, 
                 and bool(desktop_email)
                 and cli_email.strip().lower() == desktop_email.strip().lower()
             )
-            if desktop_acct is not None and not in_sync_cli:
+            if (not cli_only) and desktop_acct is not None and not in_sync_cli:
                 decision = "sync_cli_to_desktop"
                 target_acct = desktop_acct
                 note = "桌面端健康，仅对齐 CLI 凭据（不重启桌面端）"
@@ -299,48 +387,62 @@ def evaluate_pool_once(args, state, now=None, dry_run=False, init_log_eof=True, 
                     action = "cli_synced"
             else:
                 decision = "pool_keep"
-                target_acct = desktop_acct
+                target_acct = active_acct
                 if not dry_run:
                     state.pop("pending_switch", None)
-                    if args.force and desktop_acct is not None:
+                    if args.force and active_acct is not None:
                         sync_cli_only(
-                            desktop_acct,
+                            active_acct,
                             no_reload=args.no_reload,
                             sync_cursor_flag=sync_cursor_flag,
                             force=True,
                         )
                         action = "forced"
+                    elif cli_only and sync_cursor_flag and active_acct is not None:
+                        sync_cursor(active_acct)
                     save_state(state)
 
     want_email = target_acct.get("email") if target_acct else None
-    in_sync = bool(
-        desktop_email
-        and cli_email
-        and want_email
-        and desktop_email.strip().lower() == cli_email.strip().lower() == want_email.strip().lower()
-    )
+    if cli_only:
+        in_sync = bool(
+            cli_email
+            and want_email
+            and cli_email.strip().lower() == want_email.strip().lower()
+        )
+    else:
+        in_sync = bool(
+            desktop_email
+            and cli_email
+            and want_email
+            and desktop_email.strip().lower() == cli_email.strip().lower() == want_email.strip().lower()
+        )
+    score_summary = {
+        "weekly_5h": None if active_score["weekly_5h"] is None else round(active_score["weekly_5h"], 4),
+        "models_min_frac": None if active_score["models_min_frac"] is None else round(active_score["models_min_frac"], 4),
+        "effective_frac": None if active_score["effective_frac"] is None else round(active_score["effective_frac"], 4),
+        "zero_models": active_score.get("zero_models") or [],
+        "stale": active_score["stale"],
+    }
     status = {
         "ok": True,
         "mode": args.mode,
+        "cli_only": cli_only,
         "decision": decision,
         "action": action,
         "desktop_account": desktop_email,
-        "desktop_reason": desktop_reason or None,
-        "desktop_reason_code": desktop_meta.get("reason_code"),
+        "desktop_reason": (active_reason or None) if cli_only else (desktop_reason or None),
+        "desktop_reason_code": active_reason_code if cli_only else desktop_meta.get("reason_code"),
         "cli_account": cli_email,
         "cli_source": cli_src,
+        "cli_reason": (active_reason or None) if cli_only else None,
+        "active_account": cli_email if cli_only else desktop_email,
         "target_account": want_email,
         "in_sync": in_sync,
         "threshold": args.threshold,
         "urgent_threshold": args.urgent_threshold,
         "quota_group": args.group,
-        "desktop_quota": {
-            "weekly_5h": None if d_score["weekly_5h"] is None else round(d_score["weekly_5h"], 4),
-            "models_min_frac": None if d_score["models_min_frac"] is None else round(d_score["models_min_frac"], 4),
-            "effective_frac": None if d_score["effective_frac"] is None else round(d_score["effective_frac"], 4),
-            "zero_models": d_score.get("zero_models") or [],
-            "stale": d_score["stale"],
-        },
+        "active_quota": score_summary,
+        "desktop_quota": score_summary,
         "cooldowns": cds,
         "pending_switch": state.get("pending_switch"),
         "pool": describe_table(full_table, desktop_email, cli_email, cooldowns=cds, now=now),
@@ -425,17 +527,30 @@ def _evaluate_legacy(args, state, now, dry_run=False):
 
 
 def _print_check(status):
-    print("模式           : %s" % status.get("mode"))
-    print("桌面端当前账号 : %s%s" % (
-        status.get("desktop_account"),
-        ("  (%s)" % status["desktop_reason"]) if status.get("desktop_reason") else "",
-    ))
-    print("CLI   当前账号 : %s  (来源 %s)" % (status.get("cli_account"), status.get("cli_source")))
-    dq = status.get("desktop_quota")
-    if dq:
-        print("桌面端额度     : weekly_5h=%s models_min=%s effective=%s zero=%s" % (
-            dq.get("weekly_5h"), dq.get("models_min_frac"), dq.get("effective_frac"), dq.get("zero_models"),
+    if status.get("cli_only"):
+        print("模式           : %s (cli-only)" % status.get("mode"))
+        print("CLI   当前账号 : %s  (来源 %s)%s" % (
+            status.get("cli_account"),
+            status.get("cli_source"),
+            ("  (%s)" % status["cli_reason"]) if status.get("cli_reason") else "",
         ))
+        aq = status.get("active_quota") or status.get("desktop_quota")
+        if aq:
+            print("CLI   额度     : weekly_5h=%s models_min=%s effective=%s zero=%s" % (
+                aq.get("weekly_5h"), aq.get("models_min_frac"), aq.get("effective_frac"), aq.get("zero_models"),
+            ))
+    else:
+        print("模式           : %s" % status.get("mode"))
+        print("桌面端当前账号 : %s%s" % (
+            status.get("desktop_account"),
+            ("  (%s)" % status["desktop_reason"]) if status.get("desktop_reason") else "",
+        ))
+        print("CLI   当前账号 : %s  (来源 %s)" % (status.get("cli_account"), status.get("cli_source")))
+        dq = status.get("desktop_quota")
+        if dq:
+            print("桌面端额度     : weekly_5h=%s models_min=%s effective=%s zero=%s" % (
+                dq.get("weekly_5h"), dq.get("models_min_frac"), dq.get("effective_frac"), dq.get("zero_models"),
+            ))
     pool_rows = status.get("pool") or []
     if pool_rows:
         print("额度池 (%s)    : 阈值=%.0f%%" % (status.get("quota_group"), (status.get("threshold") or 0) * 100))
@@ -469,10 +584,14 @@ def _handle_switch_to(args):
     if not acct or not usable(acct):
         print("ERROR 账号不存在或不可用: %s" % email, file=sys.stderr)
         return 3
+    extra_logs = getattr(args, "extra_log", None) or []
     with acquire_lock(nonblocking=False):
         state = load_state()
-        _, _, meta = tools_active_account("classic")
-        from_email = meta.get("raw_email")
+        if args.cli_only:
+            from_email, _ = cli_identity()
+        else:
+            _, _, meta = tools_active_account("classic")
+            from_email = meta.get("raw_email")
         ok, res = switch_desktop_and_cli(
             acct,
             state,
@@ -484,19 +603,48 @@ def _handle_switch_to(args):
             sync_cursor_flag=True,
             notify=not args.no_notify,
             force=True,
+            extra_logs=extra_logs,
         )
         if not ok:
             print(json.dumps({"ok": False, "error": res.get("error")}, ensure_ascii=False))
             return 4
         if args.json:
             print(json.dumps({"ok": True, "switched_to": acct.get("email"), "cli_only": args.cli_only}, ensure_ascii=False))
+        elif args.cli_only:
+            print("已切换 CLI 账号至: %s (cli_only=True)" % acct.get("email"))
         else:
             print("已切换双端账号至: %s (cli_only=%s)" % (acct.get("email"), args.cli_only))
         return 0
 
 
+def _pool_mtime_signature(paths):
+    sig = []
+    try:
+        sig.append(("idx", os.stat(paths["ACCOUNTS_INDEX"]).st_mtime))
+    except OSError:
+        sig.append(("idx", 0.0))
+    acct_dir = paths["ACCOUNTS_DIR"]
+    try:
+        dir_mtime = os.stat(acct_dir).st_mtime
+        entries = []
+        for name in sorted(os.listdir(acct_dir)):
+            if not name.endswith(".json"):
+                continue
+            try:
+                st = os.stat(os.path.join(acct_dir, name))
+                entries.append((name, st.st_mtime, st.st_size))
+            except OSError:
+                pass
+        sig.append(("dir", dir_mtime, tuple(entries)))
+    except OSError:
+        sig.append(("dir", 0.0, ()))
+    return tuple(sig)
+
+
 def run_watch(args):
     paths = get_paths()
+    cli_only = bool(getattr(args, "cli_only", False))
+    extra_logs = getattr(args, "extra_log", None) or []
     watch_lock_path = paths["LOCK_PATH"] + ".watch"
     os.makedirs(os.path.dirname(watch_lock_path), exist_ok=True)
     wfd = os.open(watch_lock_path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -521,20 +669,17 @@ def run_watch(args):
     signal.signal(signal.SIGINT, _on_stop)
     signal.signal(signal.SIGUSR1, _on_wake)
 
-    log("WATCH 启动 (mode=%s, threshold=%.2f, poll=%.1fs, quota_poll=%.1fs)" % (
-        args.mode, args.threshold, args.poll_seconds, args.quota_poll_seconds,
+    log("WATCH 启动 (mode=%s, cli_only=%s, threshold=%.2f, poll=%.1fs, quota_poll=%.1fs, extra_logs=%d)" % (
+        args.mode, cli_only, args.threshold, args.poll_seconds, args.quota_poll_seconds, len(extra_logs),
     ))
 
     with acquire_lock(nonblocking=False):
         st = load_state()
-        scan_logs_for_quota_errors(st, now=time.time(), init_to_eof=True)
+        scan_logs_for_quota_errors(st, now=time.time(), init_to_eof=True, cli_only=cli_only, extra_logs=extra_logs)
         evaluate_pool_once(args, st, now=time.time(), dry_run=False, init_log_eof=True, pre_hits=[])
 
     last_full_ts = time.time()
-    try:
-        last_idx_mtime = os.stat(paths["ACCOUNTS_INDEX"]).st_mtime
-    except OSError:
-        last_idx_mtime = 0.0
+    last_sig = _pool_mtime_signature(paths)
 
     try:
         while not flags["stop"]:
@@ -548,16 +693,19 @@ def run_watch(args):
 
             try:
                 now = time.time()
-                try:
-                    cur_mtime = os.stat(paths["ACCOUNTS_INDEX"]).st_mtime
-                except OSError:
-                    cur_mtime = last_idx_mtime
-                mtime_changed = cur_mtime != last_idx_mtime
-                last_idx_mtime = cur_mtime
+                cur_sig = _pool_mtime_signature(paths)
+                mtime_changed = cur_sig != last_sig
+                last_sig = cur_sig
 
                 with acquire_lock(nonblocking=False):
                     state = load_state()
-                    hits = scan_logs_for_quota_errors(state, now=now, init_to_eof=True)
+                    hits = scan_logs_for_quota_errors(
+                        state,
+                        now=now,
+                        init_to_eof=True,
+                        cli_only=cli_only,
+                        extra_logs=extra_logs,
+                    )
                     due_full = (now - last_full_ts) >= args.quota_poll_seconds
                     need_eval = bool(hits) or flags["wake"] or mtime_changed or bool(state.get("pending_switch")) or due_full
                     if need_eval:
@@ -598,9 +746,10 @@ def build_parser():
     ap.add_argument("--idle-max-wait", type=float, default=300.0, help="等待桌面端空闲最长秒数")
     ap.add_argument("--sync-cursor", action="store_true", help="同步 current_agy_account_id 游标")
     ap.add_argument("--no-reload", action="store_true", help="不触发 hub 重载标记")
-    ap.add_argument("--no-notify", action="store_true", help="不发送 macOS 通知")
-    ap.add_argument("--cli-only", action="store_true", help="只切 CLI，不调用 antigravity-tools 切桌面端")
-    ap.add_argument("--jit", action="store_true", help="快速 JIT 路径：仅非阻塞同步 CLI 与桌面端一致")
+    ap.add_argument("--no-notify", action="store_true", help="关闭桌面系统通知（Linux 纯 CLI 模式建议开启）")
+    ap.add_argument("--cli-only", action="store_true", help="纯 CLI 主锚点模式（Linux/无桌面环境用：以 cli_identity() 为主锚点，跳过 antigravity-tools）")
+    ap.add_argument("--extra-log", action="append", default=[], metavar="PATH_OR_GLOB", help="额外监听的 429 日志文件或通配路径（如 dsh/gemini CLI 日志），可重复指定")
+    ap.add_argument("--jit", action="store_true", help="快速 JIT 路径：非阻塞对齐 CLI 凭据")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出结果")
     return ap
 

@@ -8,10 +8,10 @@ import re
 import subprocess
 import time
 
-from .config import get_paths, redact_text
+from .config import get_extra_log_patterns, get_paths, redact_text
 
 _RESET_RE = re.compile(
-    r"Resets\s+in\s+(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?",
+    r"resets?\s+(?:in|after)\s+(?:(\d+)\s*d\s*)?(?:(\d+)\s*h\s*)?(?:(\d+)\s*m\s*)?(?:(\d+)\s*s)?",
     re.I,
 )
 
@@ -39,6 +39,12 @@ _GLOG_ERR_RE = re.compile(r"(?:^|\s)E\d{4}\s+\d{2}:\d{2}:\d{2}")
 _QUOTA_ERR_RE = re.compile(
     r"(RESOURCE_EXHAUSTED\s*\(code\s*429\)|Individual quota reached|"
     r"QUOTA_EXHAUSTED|quota\s+(?:reached|exceeded|exhausted)|rateLimitExceeded)",
+    re.I,
+)
+_EXTRA_QUOTA_RE = re.compile(
+    r"(exhausted your capacity|quota\s+(?:limit\s+)?(?:reached|exceeded|exhausted)|"
+    r"\b429\b.*(?:resource_exhausted|too many requests|quota|rateLimitExceeded|exhausted)|"
+    r"(?:resource_exhausted|rateLimitExceeded).*\b429\b)",
     re.I,
 )
 
@@ -81,25 +87,28 @@ def parse_reset_duration(line):
     return total if total > 0 else None
 
 
-def is_quota_error_line(line):
+def is_quota_error_line(line, extra_source=False):
     if not line:
         return False
     low = line.lower()
     for marker in _IGNORE_MARKERS:
         if marker in low:
             return False
+    if extra_source:
+        return bool(_QUOTA_ERR_RE.search(line) or _EXTRA_QUOTA_RE.search(line))
     has_ctx = any(m in low for m in _CONTEXT_MARKERS) or bool(_GLOG_ERR_RE.search(line))
     if not has_ctx:
         return False
     return bool(_QUOTA_ERR_RE.search(line))
 
 
-def _watched_log_paths():
+def _watched_log_paths(cli_only=False, extra_logs=None):
     paths = get_paths()
     targets = []
-    ls_log = paths["DESKTOP_LS_LOG"]
-    if ls_log and os.path.isfile(ls_log):
-        targets.append(("desktop", ls_log))
+    if not cli_only:
+        ls_log = paths["DESKTOP_LS_LOG"]
+        if ls_log and os.path.isfile(ls_log):
+            targets.append(("desktop", ls_log))
     cli_dir = paths["CLI_LOG_DIR"]
     if cli_dir and os.path.isdir(cli_dir):
         candidates = glob.glob(os.path.join(cli_dir, "cli-*.log"))
@@ -107,6 +116,20 @@ def _watched_log_paths():
         candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         for p in candidates[:3]:
             targets.append(("cli", p))
+
+    seen = {os.path.realpath(p) for _, p in targets}
+    for pat in get_extra_log_patterns(extra_logs):
+        if any(ch in pat for ch in "*?["):
+            matched = [p for p in glob.glob(pat) if os.path.isfile(p)]
+            matched.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            matched = matched[:5]
+        else:
+            matched = [pat] if os.path.isfile(pat) else []
+        for p in matched:
+            rp = os.path.realpath(p)
+            if rp not in seen:
+                seen.add(rp)
+                targets.append(("extra", p))
     return targets
 
 
@@ -119,10 +142,10 @@ def _prune_cursors(cursors, active_paths):
             cursors.pop(k, None)
 
 
-def scan_logs_for_quota_errors(state, now=None, init_to_eof=True):
+def scan_logs_for_quota_errors(state, now=None, init_to_eof=True, cli_only=False, extra_logs=None):
     now = now if now is not None else time.time()
     cursors = state.setdefault("log_cursors", {})
-    targets = _watched_log_paths()
+    targets = _watched_log_paths(cli_only=cli_only, extra_logs=extra_logs)
     hits = []
     for source, path in targets:
         try:
@@ -159,7 +182,7 @@ def scan_logs_for_quota_errors(state, now=None, init_to_eof=True):
         cursors[path] = {"inode": st.st_ino, "offset": st.st_size}
         text = chunk.decode("utf-8", errors="replace")
         for line in text.splitlines():
-            if is_quota_error_line(line):
+            if is_quota_error_line(line, extra_source=(source == "extra")):
                 hits.append({
                     "source": source,
                     "path": path,
@@ -172,9 +195,9 @@ def scan_logs_for_quota_errors(state, now=None, init_to_eof=True):
     return hits
 
 
-def advance_log_cursors_to_eof(state):
+def advance_log_cursors_to_eof(state, cli_only=False, extra_logs=None):
     cursors = state.setdefault("log_cursors", {})
-    for _, path in _watched_log_paths():
+    for _, path in _watched_log_paths(cli_only=cli_only, extra_logs=extra_logs):
         try:
             st = os.stat(path)
             cursors[path] = {"inode": st.st_ino, "offset": st.st_size}

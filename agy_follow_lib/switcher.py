@@ -4,8 +4,10 @@
 import base64
 import datetime as _dt
 import os
+import shutil
 import signal
 import subprocess
+import sys
 import time
 
 from .config import (
@@ -40,7 +42,7 @@ def decode_email(id_token):
 
 def cli_identity():
     paths = get_paths()
-    for path in (paths["CLI_TOKEN"], paths["JETSKI_TOKEN"]):
+    for path in (paths["CLI_TOKEN"], paths["ANTIGRAVITY_TOKEN"], paths["JETSKI_TOKEN"]):
         data = read_json(path)
         if isinstance(data, dict):
             email = data.get("id_token_email") or decode_email(data.get("id_token"))
@@ -100,12 +102,16 @@ def desired_payloads(acct):
         "id_token_email": email,
         "id_token": id_token,
     }
-    return {
+    payloads = {
         paths["OAUTH_CREDS"]: oauth_creds,
         paths["GOOGLE_ACCOUNTS"]: google_accounts,
         paths["CLI_TOKEN"]: cli_like,
         paths["JETSKI_TOKEN"]: cli_like,
     }
+    agy_token_path = paths["ANTIGRAVITY_TOKEN"]
+    if os.path.isdir(os.path.dirname(agy_token_path)) or os.path.exists(agy_token_path):
+        payloads[agy_token_path] = cli_like
+    return payloads
 
 
 def bump_hub_reload(email):
@@ -139,8 +145,9 @@ def reap_orphan_sidecars():
     killed = 0
     cleaned_hubs = 0
     try:
+        ps_bin = shutil.which("ps") or "/bin/ps"
         out = subprocess.check_output(
-            ["/bin/ps", "-axo", "pid=,ppid=,command="],
+            [ps_bin, "-axo", "pid=,ppid=,command="],
             text=True,
             stderr=subprocess.DEVNULL,
             timeout=5,
@@ -239,7 +246,7 @@ def switch_classic_via_tools(acct, timeout=30):
 
 
 def notify_macos(title, message):
-    if os.environ.get("AGY_NO_NOTIFY") == "1":
+    if sys.platform != "darwin" or os.environ.get("AGY_NO_NOTIFY") == "1" or not os.path.exists("/usr/bin/osascript"):
         return
     script = (
         "on run argv\n"
@@ -268,6 +275,7 @@ def switch_desktop_and_cli(
     sync_cursor_flag=True,
     notify=True,
     force=False,
+    extra_logs=None,
 ):
     now = now if now is not None else time.time()
     want_email = acct.get("email")
@@ -279,7 +287,7 @@ def switch_desktop_and_cli(
 
     cli_res = sync_cli_only(acct, no_reload=no_reload, sync_cursor_flag=sync_cursor_flag, force=force)
     reap_orphan_sidecars()
-    advance_log_cursors_to_eof(state)
+    advance_log_cursors_to_eof(state, cli_only=cli_only, extra_logs=extra_logs)
 
     state["last_switch_ts"] = int(now)
     state["last_switch"] = {
@@ -292,15 +300,17 @@ def switch_desktop_and_cli(
     state.pop("pending_switch", None)
     save_state(state)
 
-    if notify:
+    if notify and sys.platform == "darwin":
         notify_macos(
             "Antigravity 账号已切换",
             "%s -> %s (%s)" % (from_email or "?", want_email, trigger),
         )
 
+    prefix = "CLI_SYNC" if cli_only else "DUAL_SYNC"
     log(
-        "DUAL_SYNC %s -> %s (trigger=%s, cli_only=%s, backups=%d, hub_reload=%s)"
+        "%s %s -> %s (trigger=%s, cli_only=%s, backups=%d, hub_reload=%s)"
         % (
+            prefix,
             from_email,
             want_email,
             trigger,

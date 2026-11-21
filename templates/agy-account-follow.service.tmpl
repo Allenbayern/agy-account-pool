@@ -1,0 +1,18 @@
+[Unit]
+Description=Antigravity CLI Account Pool Auto-Switch Watcher
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME={{HOME}}
+Environment=AGY_FOLLOW_QUIET=1
+Environment=AGY_NO_NOTIFY=1
+Environment=PATH={{BIN_DIR}}:/usr/local/bin:/usr/bin:/bin
+ExecStart={{PYTHON3}} {{BIN_DIR}}/agy-account-follow --watch --mode pool{{CLI_ONLY_ARG}}{{NO_NOTIFY_ARG}} --threshold {{THRESHOLD}} --group {{GROUP}} --poll-seconds {{POLL_SECONDS}} --quota-poll-seconds {{QUOTA_POLL_SECONDS}}{{EXTRA_LOG_ARGS}}
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

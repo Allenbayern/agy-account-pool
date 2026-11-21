@@ -35,16 +35,27 @@ _REDACT_RE = re.compile(
 
 def _env_path(primary, secondary, default):
     raw = os.environ.get(primary) or os.environ.get(secondary) or default
-    return os.path.expanduser(raw)
+    return os.path.expanduser(raw) if raw else ""
 
 
 def get_paths():
     home = os.path.expanduser("~")
+    is_darwin = sys.platform == "darwin"
     tools_dir = _env_path("AGY_FOLLOW_TOOLS_DIR", "TOOLS_DIR", os.path.join(home, ".antigravity_tools"))
     gemini_dir = _env_path("AGY_FOLLOW_GEMINI_DIR", "GEMINI_DIR", os.path.join(home, ".gemini"))
     cli_dir = os.path.join(gemini_dir, "antigravity-cli")
     cache_dir = os.path.join(cli_dir, "cache")
     config_default = os.path.join(home, ".config", "agy-account-follow", "config.json")
+    default_ls_log = (
+        os.path.join(home, "Library", "Logs", "Antigravity", "language_server.log")
+        if is_darwin
+        else ""
+    )
+    if is_darwin:
+        default_log_path = os.path.join(home, "Library", "Logs", "agy-account-follow.log")
+    else:
+        state_home = os.path.expanduser(os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state"))
+        default_log_path = os.path.join(state_home, "agy-account-follow", "agy-account-follow.log")
     return {
         "HOME": home,
         "TOOLS_DIR": tools_dir,
@@ -55,19 +66,12 @@ def get_paths():
         "OAUTH_CREDS": os.path.join(gemini_dir, "oauth_creds.json"),
         "GOOGLE_ACCOUNTS": os.path.join(gemini_dir, "google_accounts.json"),
         "CLI_TOKEN": os.path.join(cli_dir, "antigravity-oauth-token"),
+        "ANTIGRAVITY_TOKEN": os.path.join(gemini_dir, "antigravity", "antigravity-oauth-token"),
         "JETSKI_TOKEN": os.path.join(gemini_dir, "jetski-standalone-oauth-token"),
         "HUB_RELOAD": os.path.join(cache_dir, "agy-swap-hub-reload"),
-        "DESKTOP_LS_LOG": _env_path(
-            "AGY_DESKTOP_LS_LOG",
-            "DESKTOP_LS_LOG",
-            os.path.join(home, "Library", "Logs", "Antigravity", "language_server.log"),
-        ),
+        "DESKTOP_LS_LOG": _env_path("AGY_DESKTOP_LS_LOG", "DESKTOP_LS_LOG", default_ls_log),
         "CLI_LOG_DIR": _env_path("AGY_CLI_LOG_DIR", "CLI_LOG_DIR", os.path.join(cli_dir, "log")),
-        "LOG_PATH": _env_path(
-            "AGY_FOLLOW_LOG_PATH",
-            "LOG_PATH",
-            os.path.join(home, "Library", "Logs", "agy-account-follow.log"),
-        ),
+        "LOG_PATH": _env_path("AGY_FOLLOW_LOG_PATH", "LOG_PATH", default_log_path),
         "AT_BIN": _env_path("AGY_AT_BIN", "AT_BIN", os.path.join(home, ".local", "bin", "antigravity-tools")),
         "LOCK_PATH": _env_path("AGY_LOCK_PATH", "LOCK_PATH", os.path.join(cache_dir, "agy-follow.lock")),
         "STATE_PATH": _env_path("AGY_STATE_PATH", "STATE_PATH", os.path.join(cache_dir, "agy-follow-state.json")),
@@ -79,6 +83,36 @@ def load_user_config():
     cfg_path = get_paths()["CONFIG_PATH"]
     data = read_json(cfg_path)
     return data if isinstance(data, dict) else {}
+
+
+def _split_extra_raw(raw):
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        return [p for p in re.split(r"[,%s]+" % re.escape(os.pathsep), raw) if p and p.strip()]
+    if isinstance(raw, (list, tuple, set)):
+        return [p for p in raw if isinstance(p, str) and p.strip()]
+    return []
+
+
+def get_extra_log_patterns(cli_extra_logs=None):
+    raw_items = []
+    if cli_extra_logs:
+        for item in cli_extra_logs:
+            if isinstance(item, str) and item.strip():
+                raw_items.append(item)
+    raw_items.extend(_split_extra_raw(os.environ.get("AGY_EXTRA_LOGS")))
+    raw_items.extend(_split_extra_raw(load_user_config().get("extra_logs")))
+
+    out = []
+    seen = set()
+    for item in raw_items:
+        expanded = os.path.expanduser(item.strip())
+        if not expanded or expanded in seen:
+            continue
+        seen.add(expanded)
+        out.append(expanded)
+    return out
 
 
 def _norm_email_set(items):
