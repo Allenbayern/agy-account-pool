@@ -24,6 +24,7 @@ MIN_SWITCH_INTERVAL_ERROR = 15
 DEFAULT_QUARANTINE_SECONDS = 1800
 MIN_QUARANTINE_SECONDS = 300
 MAX_QUARANTINE_SECONDS = 6 * 3600
+LOG_MAX_BYTES = 2 * 1024 * 1024
 
 _REDACT_RE = re.compile(
     r"(ya29\.[A-Za-z0-9._-]+|1//[A-Za-z0-9._-]+|eyJ[A-Za-z0-9._-]+|"
@@ -119,12 +120,28 @@ def redact_text(text):
     return _REDACT_RE.sub("<REDACTED>", str(text))
 
 
+def _rotate_log_if_needed(log_path):
+    raw_max = os.environ.get("AGY_LOG_MAX_BYTES")
+    try:
+        max_bytes = int(raw_max) if raw_max else LOG_MAX_BYTES
+    except ValueError:
+        max_bytes = LOG_MAX_BYTES
+    if max_bytes <= 0:
+        return
+    try:
+        if os.path.exists(log_path) and os.path.getsize(log_path) >= max_bytes:
+            os.replace(log_path, log_path + ".1")
+    except OSError:
+        pass
+
+
 def log(msg):
     paths = get_paths()
     stamp = _dt.datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
     line = "%s %s" % (stamp, redact_text(msg))
     try:
         os.makedirs(os.path.dirname(paths["LOG_PATH"]), exist_ok=True)
+        _rotate_log_if_needed(paths["LOG_PATH"])
         with open(paths["LOG_PATH"], "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     except OSError:

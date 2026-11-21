@@ -6,8 +6,8 @@ THRESHOLD="0.15"
 GROUP="gemini"
 POLL_SECONDS="3"
 QUOTA_POLL_SECONDS="30"
-IDLE_SECONDS="15"
-IDLE_MAX_WAIT="120"
+IDLE_SECONDS="60"
+IDLE_MAX_WAIT="300"
 BIN_DIR="$HOME/.local/bin"
 NO_LAUNCHAGENT=0
 NO_HOOK=0
@@ -30,8 +30,8 @@ Usage: ./install.sh [options]
   --group <name>              Quota group to watch (default: gemini)
   --poll-seconds <sec>        Log watcher poll interval (default: 3)
   --quota-poll-seconds <sec>  Full quota evaluation interval (default: 30)
-  --idle-seconds <sec>        Quiet window before mild threshold switch (default: 15)
-  --idle-max-wait <sec>       Max defer time while desktop is streaming (default: 120)
+  --idle-seconds <sec>        Quiet window before mild threshold switch (default: 60)
+  --idle-max-wait <sec>       Max defer time while desktop is streaming (default: 300)
   --bin-dir <dir>             Target symlink bin directory (default: ~/.local/bin)
   --no-launchagent            Skip LaunchAgent installation/bootstrap
   --no-hook                   Skip ~/.gemini/bin/agy wrapper hook installation

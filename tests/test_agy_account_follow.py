@@ -2,8 +2,10 @@
 """Sanitized unit tests for agy-account-pool (agy-account-follow)."""
 
 import base64
+from contextlib import redirect_stderr
 import datetime as _dt
 import fcntl
+import io
 import json
 import os
 import sys
@@ -310,6 +312,21 @@ class TestAgyAccountPool(unittest.TestCase):
         self.assertEqual(rc2, 0)
         self.assertEqual(switcher.cli_identity()[0], "acct1@example.com")
         self.assertFalse(os.path.exists(self.at_calls))
+
+    def test_9_log_rotation_and_quiet_stderr(self):
+        os.environ["AGY_LOG_MAX_BYTES"] = "200"
+        os.environ["AGY_FOLLOW_QUIET"] = "1"
+        err_buf = io.StringIO()
+        with redirect_stderr(err_buf):
+            for i in range(5):
+                config.log("ROTATION_CHECK line=%d payload=%s" % (i, "x" * 60))
+        self.assertEqual(err_buf.getvalue(), "")
+        rotated = self.log_path + ".1"
+        self.assertTrue(os.path.exists(rotated))
+        self.assertTrue(os.path.exists(self.log_path))
+        self.assertLess(os.path.getsize(self.log_path), 200)
+        with open(self.log_path, encoding="utf-8") as fh:
+            self.assertIn("ROTATION_CHECK line=4", fh.read())
 
 
 if __name__ == "__main__":

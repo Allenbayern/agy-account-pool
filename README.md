@@ -21,7 +21,7 @@ Unified macOS auto-switcher that keeps **Antigravity Desktop (Classic)** and **`
                   └───────────────────┬────────────────────┘
                                       ▼
                      agy-account-follow --watch (--mode pool)
-                       ├─ Desktop idle-guard (15s quiet, max wait 120s)
+                       ├─ Desktop idle-guard (60s quiet, max wait 300s)
                        ├─ Per-account quarantine (from "Resets in ...")
                        └─ Authoritative Desktop drift fix (CLI-only sync)
                                       │
@@ -35,9 +35,10 @@ Unified macOS auto-switcher that keeps **Antigravity Desktop (Classic)** and **`
 
 - **Dual triggers**:
   1. **Live 429 watcher**: Tails Desktop `language_server.log` and the newest `cli-*.log` files by `(inode, offset)`, ignores monitor/503/network noise, parses `Resets in XhYmZs`, quarantines the depleted account, and switches both targets immediately.
-  2. **Dual-layer quota threshold** (default `15%` on `gemini` group): Ignores unrelated Claude/GPT exhaustion, bypasses busy wait if `≤ 5%` or any primary model hits `0%`, otherwise waits for `15s` idle (capped at `120s`).
+  2. **Dual-layer quota threshold** (default `15%` on `gemini` group): Ignores unrelated Claude/GPT exhaustion, bypasses busy wait if `≤ 5%` or any primary model hits `0%`, otherwise waits for `60s` idle (capped at `300s`).
 - **Authoritative Desktop drift invariant**: If Desktop is healthy and CLI drifted, only syncs CLI credentials and cursor — never restarts Desktop `language_server`.
 - **Fast `--jit` wrapper hook**: Optional `~/.gemini/bin/agy` hook aligns CLI credentials before every `agy` invocation with a non-blocking `flock`.
+- **Automatic log rotation & quiet stderr**: Rotates `~/Library/Logs/agy-account-follow.log` at 2 MB (keeping `.log.1`) and sets `AGY_FOLLOW_QUIET=1` in LaunchAgent so `err.log` captures only uncaught exceptions.
 - **Zero external Python dependencies**: Standard library only (`Python 3.9+` on macOS).
 
 ## Prerequisites
