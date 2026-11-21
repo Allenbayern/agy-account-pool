@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>{{BIN_DIR}}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.agy.account-follow</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{{PYTHON3}}</string>
+		<string>{{BIN_DIR}}/agy-account-follow</string>
+		<string>--watch</string>
+		<string>--mode</string>
+		<string>pool</string>
+		<string>--threshold</string>
+		<string>{{THRESHOLD}}</string>
+		<string>--group</string>
+		<string>{{GROUP}}</string>
+		<string>--poll-seconds</string>
+		<string>{{POLL_SECONDS}}</string>
+		<string>--quota-poll-seconds</string>
+		<string>{{QUOTA_POLL_SECONDS}}</string>
+		<string>--idle-seconds</string>
+		<string>{{IDLE_SECONDS}}</string>
+		<string>--idle-max-wait</string>
+		<string>{{IDLE_MAX_WAIT}}</string>
+		<string>--sync-cursor</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>{{HOME}}/Library/Logs/agy-account-follow.err.log</string>
+	<key>StandardOutPath</key>
+	<string>{{HOME}}/Library/Logs/agy-account-follow.out.log</string>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+</dict>
+</plist>

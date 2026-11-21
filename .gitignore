@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+*.bak*
+*.tmp
+*.tmp-*
+!templates/*.tmpl
+.env
+.env.*
+config.local.json
+.pytest_cache/
+.venv/

@@ -1,0 +1,6 @@
+{
+  "allowed_accounts": [],
+  "excluded_accounts": [
+    "personal@example.com"
+  ]
+}
