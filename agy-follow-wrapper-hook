@@ -16,10 +16,14 @@ import sys
 import time
 
 WRAPPER = os.path.expanduser("~/.gemini/bin/agy")
+EXTRA_WRAPPERS = [
+    os.path.expanduser("~/.local/bin/agy"),
+]
 MARK_BEGIN = "# >>> agy-account-follow hook (managed)"
 MARK_END = "# <<< agy-account-follow hook"
 
 HOOK_BLOCK = """{begin}
+export AGY_SWAP_SKIP_SYNC="${{AGY_SWAP_SKIP_SYNC:-1}}"
 agy_follow_sync() {{
   if [ "${{AGY_FOLLOW_SKIP:-0}}" = "1" ]; then return 0; fi
   _follow="$HOME/.local/bin/agy-account-follow"
@@ -31,6 +35,18 @@ agy_follow_sync() {{
 """.format(begin=MARK_BEGIN, end=MARK_END)
 
 CALL_LINE = "agy_follow_sync"
+
+
+def _target_wrappers():
+    targets = []
+    seen = set()
+    for p in [WRAPPER] + list(EXTRA_WRAPPERS):
+        if os.path.exists(p):
+            rp = os.path.realpath(p)
+            if rp not in seen:
+                seen.add(rp)
+                targets.append(p)
+    return targets
 
 
 def read(path):
@@ -64,75 +80,25 @@ def extract_block(text):
     return "\n".join(lines[start : end + 1])
 
 
+def _has_call_inside_swap_if(text):
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if "--sync-session" in line and "swap_command" in line:
+            if i + 1 < len(lines) and lines[i + 1].strip() == "agy_follow_sync || true":
+                return True
+    return False
+
+
 def is_hook_current(text):
     blk = extract_block(text)
-    return blk is not None and blk.strip() == HOOK_BLOCK.strip()
+    return (
+        blk is not None
+        and blk.strip() == HOOK_BLOCK.strip()
+        and not _has_call_inside_swap_if(text)
+    )
 
 
-def _replace_block(text):
-    lines = text.splitlines()
-    out = []
-    skipping = False
-    replaced = False
-    for line in lines:
-        if line.strip() == MARK_BEGIN and not replaced:
-            skipping = True
-            out.extend(HOOK_BLOCK.rstrip("\n").splitlines())
-            replaced = True
-            continue
-        if skipping:
-            if line.strip() == MARK_END:
-                skipping = False
-            continue
-        out.append(line)
-    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
-
-
-def install(quiet=False):
-    text = read(WRAPPER)
-    if has_hook(text):
-        if is_hook_current(text):
-            if not quiet:
-                print("已是最新打钩状态，无需修改")
-            return 0
-        new_text = _replace_block(text)
-        backup = "%s.bak-agyfollow-%s" % (WRAPPER, time.strftime("%Y%m%d-%H%M%S"))
-        shutil.copy2(WRAPPER, backup)
-        write(WRAPPER, new_text)
-        print("已升级旧钩子为 pool --jit 版。备份: %s" % backup)
-        return 0
-
-    lines = text.splitlines()
-    insert_at = None
-    for i, line in enumerate(lines):
-        if line.strip() == "esac":
-            insert_at = i + 1
-            break
-    if insert_at is None:
-        print("ERROR 找不到 case...esac 快通道，未改动", file=sys.stderr)
-        return 4
-    lines = lines[:insert_at] + [""] + HOOK_BLOCK.rstrip("\n").splitlines() + lines[insert_at:]
-
-    out = []
-    for line in lines:
-        out.append(line)
-        if "--sync-session" in line and "swap_command" in line:
-            indent = line[: len(line) - len(line.lstrip())]
-            out.append("%sagy_follow_sync || true" % indent)
-    new_text = "\n".join(out) + ("\n" if text.endswith("\n") else "")
-
-    backup = "%s.bak-agyfollow-%s" % (WRAPPER, time.strftime("%Y%m%d-%H%M%S"))
-    shutil.copy2(WRAPPER, backup)
-    write(WRAPPER, new_text)
-    print("已打钩。备份: %s" % backup)
-    return 0
-
-
-def revert():
-    text = read(WRAPPER)
-    if not has_hook(text):
-        print("没有钩子，无需撤销")
-        return 0
+def _strip_hook(text):
     lines = text.splitlines()
     out, skipping = [], False
     for line in lines:
@@ -147,10 +113,89 @@ def revert():
         if line.strip() == "agy_follow_sync || true":
             continue
         out.append(line)
-    backup = "%s.bak-agyfollow-%s" % (WRAPPER, time.strftime("%Y%m%d-%H%M%S"))
-    shutil.copy2(WRAPPER, backup)
-    write(WRAPPER, "\n".join(out) + "\n")
-    print("已撤销钩子。备份: %s" % backup)
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
+def _inject_hook(clean_text):
+    lines = clean_text.splitlines()
+    insert_at = None
+    for i, line in enumerate(lines):
+        if line.strip() == "esac":
+            insert_at = i + 1
+            break
+    if insert_at is None:
+        return None
+    lines = lines[:insert_at] + [""] + HOOK_BLOCK.rstrip("\n").splitlines() + lines[insert_at:]
+
+    out = []
+    pending_fi_indent = None
+    for line in lines:
+        out.append(line)
+        if "--sync-session" in line and "swap_command" in line:
+            pending_fi_indent = True
+            continue
+        if pending_fi_indent and line.strip() == "fi":
+            indent = line[: len(line) - len(line.lstrip())]
+            out.append("%sagy_follow_sync || true" % indent)
+            pending_fi_indent = False
+    return "\n".join(out) + ("\n" if clean_text.endswith("\n") else "")
+
+
+def install_one(path, quiet=False):
+    text = read(path)
+    if has_hook(text) and is_hook_current(text):
+        if not quiet:
+            print("[%s] 已是最新打钩状态，无需修改" % path)
+        return 0
+
+    upgrading = has_hook(text)
+    clean_text = _strip_hook(text) if upgrading else text
+    new_text = _inject_hook(clean_text)
+    if new_text is None:
+        print("ERROR [%s] 找不到 case...esac 快通道，未改动" % path, file=sys.stderr)
+        return 4
+
+    backup = "%s.bak-agyfollow-%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
+    shutil.copy2(path, backup)
+    write(path, new_text)
+    action = "已升级旧钩子为 pool --jit + 禁用 agy-swap 回写版" if upgrading else "已打钩（pool --jit + 禁用 agy-swap 回写）"
+    print("[%s] %s。备份: %s" % (path, action, backup))
+    return 0
+
+
+def install(quiet=False):
+    targets = _target_wrappers()
+    if not targets:
+        print("ERROR 包装器不存在: %s" % WRAPPER, file=sys.stderr)
+        return 4
+    rc = 0
+    for path in targets:
+        r = install_one(path, quiet=quiet)
+        if r != 0:
+            rc = r
+    return rc
+
+
+def revert_one(path):
+    text = read(path)
+    if not has_hook(text):
+        print("[%s] 没有钩子，无需撤销" % path)
+        return 0
+    new_text = _strip_hook(text)
+    backup = "%s.bak-agyfollow-%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
+    shutil.copy2(path, backup)
+    write(path, new_text)
+    print("[%s] 已撤销钩子。备份: %s" % (path, backup))
+    return 0
+
+
+def revert():
+    targets = _target_wrappers()
+    if not targets:
+        print("ERROR 包装器不存在: %s" % WRAPPER, file=sys.stderr)
+        return 4
+    for path in targets:
+        revert_one(path)
     return 0
 
 
@@ -163,17 +208,21 @@ def main():
     g.add_argument("--revert", action="store_true")
     args = ap.parse_args()
 
-    if not os.path.exists(WRAPPER):
+    targets = _target_wrappers()
+    if not targets:
         print("ERROR 包装器不存在: %s" % WRAPPER, file=sys.stderr)
         return 4
-    text = read(WRAPPER)
     if args.status:
-        hooked = has_hook(text)
-        current = is_hook_current(text)
-        print("包装器      : %s" % WRAPPER)
-        print("钩子状态    : %s" % ("已打钩 (最新) ✅" if (hooked and current) else ("已打钩 (旧版需升级) ⚠️" if hooked else "未打钩 ❌")))
-        print("agy-swap 标记: %s" % ("有（归 agy-swap 管理）" if "Managed by agy-swap" in text else "无"))
-        return 0 if (hooked and current) else 2
+        all_ok = True
+        for path in targets:
+            text = read(path)
+            hooked = has_hook(text)
+            current = is_hook_current(text)
+            all_ok = all_ok and hooked and current
+            print("包装器      : %s" % path)
+            print("钩子状态    : %s" % ("已打钩 (最新) ✅" if (hooked and current) else ("已打钩 (旧版需升级) ⚠️" if hooked else "未打钩 ❌")))
+            print("agy-swap 标记: %s" % ("有（归 agy-swap 管理）" if "Managed by agy-swap" in text else "无"))
+        return 0 if all_ok else 2
     if args.install:
         return install(quiet=args.quiet)
     return revert()

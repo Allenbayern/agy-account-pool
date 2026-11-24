@@ -102,6 +102,13 @@ def is_quota_error_line(line, extra_source=False):
     return bool(_QUOTA_ERR_RE.search(line))
 
 
+def _safe_mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return -1.0
+
+
 def _watched_log_paths(cli_only=False, extra_logs=None):
     paths = get_paths()
     targets = []
@@ -111,18 +118,25 @@ def _watched_log_paths(cli_only=False, extra_logs=None):
             targets.append(("desktop", ls_log))
     cli_dir = paths["CLI_LOG_DIR"]
     if cli_dir and os.path.isdir(cli_dir):
-        candidates = glob.glob(os.path.join(cli_dir, "cli-*.log"))
-        candidates = [p for p in candidates if os.path.isfile(p)]
-        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        for p in candidates[:3]:
+        candidates = []
+        for p in glob.glob(os.path.join(cli_dir, "cli-*.log")):
+            mt = _safe_mtime(p)
+            if mt >= 0 and os.path.isfile(p):
+                candidates.append((mt, p))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        for _, p in candidates[:3]:
             targets.append(("cli", p))
 
     seen = {os.path.realpath(p) for _, p in targets}
     for pat in get_extra_log_patterns(extra_logs):
         if any(ch in pat for ch in "*?["):
-            matched = [p for p in glob.glob(pat) if os.path.isfile(p)]
-            matched.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            matched = matched[:5]
+            matched_items = []
+            for p in glob.glob(pat):
+                mt = _safe_mtime(p)
+                if mt >= 0 and os.path.isfile(p):
+                    matched_items.append((mt, p))
+            matched_items.sort(key=lambda item: item[0], reverse=True)
+            matched = [p for _, p in matched_items[:5]]
         else:
             matched = [pat] if os.path.isfile(pat) else []
         for p in matched:
